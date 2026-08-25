@@ -1,0 +1,9 @@
+{
+  "items": [
+    {
+      "Detail": "{\"TraceId\":\"test-20260708-001\",\"TemplateConfiguration\":{\"SMSTemplate\":{\"Name\":\"balance-alert\"}},\"MessageConfiguration\":{\"EmailMessage\":{\"Substitutions\":{\"productName\":[\"CHEQUING\"],\"membershipNumber\":[\"****5493\"],\"threshold\":[\"100.00\"]},\"FromAddress\":\"alerts@yourdomain.com\",\"ReplyToAddresses\":[\"alerts@yourdomain.com\"]},\"SMSMessage\":{\"MessageType\":\"TRANSACTIONAL\"}},\"Addresses\":{\"user@example.com\":{\"ChannelType\":\"EMAIL\"},\"+16041234567\":{\"ChannelType\":\"SMS\",\"Substitutions\":{\"productName\":[\"CHEQUING\"],\"membershipNumber\":[\"****7303\"],\"threshold\":[\"100.00\"]}}}}",
+      "DetailType": "Customer Notification",
+      "Source": "com.example.notifications"
+    }
+  ]
+}

@@ -1,0 +1,310 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless event-driven messaging - Migrate from Amazon Pinpoint to AWS End User Messaging.
+  API Gateway REST API receives notification requests, EventBridge routes by channel type,
+  Lambda functions send SMS (via EUM with DynamoDB templates) and Email (via SES v2).
+
+Parameters:
+  OriginationIdentityArn:
+    Type: String
+    AllowedPattern: "^arn:aws[a-zA-Z-]*:sms-voice:[a-z0-9-]+:[0-9]{12}:(phone-number|pool|sender-id)/.+$"
+    ConstraintDescription: >
+      Must be an End User Messaging origination identity ARN, e.g.
+      arn:aws:sms-voice:us-west-2:111122223333:phone-number/abcd1234-...
+    Description: >
+      ARN of the SMS origination identity (phone number, pool, or sender ID). The ARN is
+      required rather than the E.164 number because SendTextMessage only resolves a specific
+      resource for IAM authorization when given an ARN, which is what lets the send permission
+      be scoped to this one identity instead of "*".
+      Find it with:
+      aws pinpoint-sms-voice-v2 describe-phone-numbers --query "PhoneNumbers[].{Number:PhoneNumber,Arn:PhoneNumberArn}"
+  ConfigurationSetName:
+    Type: String
+    Default: ""
+    AllowedPattern: "^[A-Za-z0-9_-]*$"
+    ConstraintDescription: >
+      Must be an AWS End User Messaging SMS configuration set name (letters, digits,
+      hyphens and underscores only), or empty. This is not an email address.
+    Description: >
+      Optional: name of an existing AWS End User Messaging SMS configuration set, used for
+      SMS delivery event tracking. Leave empty if you have not created one. This is unrelated
+      to SES and is not an email address.
+  SESFromAddress:
+    Type: String
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    ConstraintDescription: "Must be a single email address, e.g. alerts@yourdomain.com"
+    Description: "Verified SES email address for sending (e.g., alerts@yourdomain.com)"
+  MaxSMSPrice:
+    Type: String
+    Default: "2.00"
+    Description: "Maximum price (USD) willing to pay per SMS message"
+  MessageTTL:
+    Type: String
+    Default: "120"
+    Description: "Time to live (seconds) for SMS messages"
+  LogRetentionInDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: "Retention period for Lambda CloudWatch log groups. Logs are deleted after this many days."
+
+Resources:
+  ##########################################################################
+  #   EventBridge Custom Bus                                               #
+  ##########################################################################
+  MessagesEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "${AWS::StackName}-MessagesEventBus"
+
+  ##########################################################################
+  #   DynamoDB Table for SMS Templates                                     #
+  ##########################################################################
+  SMSTemplatesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-SMSTemplates"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: TemplateName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: TemplateName
+          KeyType: HASH
+      Tags:
+        - Key: Purpose
+          Value: SMS Template Storage
+        - Key: Application
+          Value: !Ref AWS::StackName
+
+  ##########################################################################
+  #   API Gateway Role - Permission to Put Events to EventBridge           #
+  ##########################################################################
+  ApiGatewayEventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: !Sub "/${AWS::StackName}/"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowApiGatewayServiceToAssumeRole
+            Effect: Allow
+            Action:
+              - "sts:AssumeRole"
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+      Policies:
+        - PolicyName: EventBridgePutEvents
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "events:PutEvents"
+                Resource:
+                  - !GetAtt MessagesEventBus.Arn
+
+  ##########################################################################
+  #   REST API Gateway                                                     #
+  ##########################################################################
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Name: !Sub "${AWS::StackName}-api"
+      Description: "REST API for event-driven messaging - Pinpoint migration"
+
+  ##########################################################################
+  #   API Gateway Method - POST with VTL mapping to EventBridge            #
+  ##########################################################################
+  ApiGatewayRootMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      # Callers must sign requests with SigV4 (IAM). The caller's IAM principal
+      # needs execute-api:Invoke on this method. To use a different authorizer
+      # (Cognito user pool, Lambda authorizer, or API key + usage plan), see the
+      # "Changing the authorizer" section in README.md.
+      AuthorizationType: AWS_IAM
+      HttpMethod: POST
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+      RequestParameters:
+        method.request.header.X-Amz-Target: false
+        method.request.header.Content-Type: false
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS
+        Credentials: !GetAtt ApiGatewayEventBridgeRole.Arn
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:events:action/PutEvents"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        RequestTemplates:
+          application/json: !Sub
+            - |-
+              #set($context.requestOverride.header.X-Amz-Target = "AWSEvents.PutEvents")
+              #set($context.requestOverride.header.Content-Type = "application/x-amz-json-1.1")
+              #set($inputRoot = $input.path('$'))
+              {
+                "Entries": [
+                  #foreach($elem in $inputRoot.items)
+                  {
+                    "Detail": "$util.escapeJavaScript($elem.Detail).replaceAll("\\'","'")",
+                    "DetailType": "$elem.DetailType",
+                    "EventBusName": "${EventBusName}",
+                    "Source": "$elem.Source"
+                  }#if($foreach.hasNext),#end
+                  #end
+                ]
+              }
+            - { EventBusName: !Ref MessagesEventBus }
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: "{}"
+      ResourceId: !GetAtt ApiGateway.RootResourceId
+      RestApiId: !Ref ApiGateway
+
+  ##########################################################################
+  #   API Gateway Deployment                                               #
+  ##########################################################################
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiGatewayRootMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: "prod"
+
+  ##########################################################################
+  #   Lambda Functions                                                     #
+  ##########################################################################
+  EmailLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-EmailProcessor"
+      Description: "Processes email events and sends via Amazon SES v2"
+      CodeUri: Lambda/
+      Handler: Email_sample.lambda_handler
+      Runtime: python3.12
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          SES_FROM_ADDRESS: !Ref SESFromAddress
+      Policies:
+        # Scoped to sending only, and only from the address supplied at deploy time.
+        # Both identity ARN forms are listed so this works whether the address or
+        # its parent domain is the verified identity in SES.
+        - Statement:
+            - Sid: SendEmailFromApprovedIdentityOnly
+              Effect: Allow
+              Action:
+                - "ses:SendEmail"
+              Resource:
+                - !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${SESFromAddress}"
+                - !Sub
+                  - "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${Domain}"
+                  - Domain: !Select [1, !Split ["@", !Ref SESFromAddress]]
+              Condition:
+                StringEquals:
+                  "ses:FromAddress": !Ref SESFromAddress
+      Events:
+        EmailRule:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref MessagesEventBus
+            Pattern:
+              detail:
+                MessageConfiguration:
+                  EmailMessage:
+                    FromAddress:
+                      - exists: true
+
+  SMSLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-SMSProcessor"
+      Description: "Processes SMS events using DynamoDB templates and sends via EUM"
+      CodeUri: Lambda/
+      Handler: SMS_sample_ddb.lambda_handler
+      Runtime: python3.12
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          TEMPLATES_TABLE_NAME: !Ref SMSTemplatesTable
+          ORIGINATION_IDENTITY_ARN: !Ref OriginationIdentityArn
+          CONFIGURATION_SET_NAME: !Ref ConfigurationSetName
+          MAX_PRICE: !Ref MaxSMSPrice
+          MESSAGE_TTL: !Ref MessageTTL
+      Policies:
+        # Scoped to the one origination identity this stack is allowed to send from.
+        # This only works because the function passes the ARN as OriginationIdentity:
+        # SendTextMessage resolves a phone-number/pool/sender-id resource for IAM
+        # authorization from an ARN, but not from a bare E.164 number.
+        - Statement:
+            - Sid: SendTextMessageFromApprovedOriginationIdentity
+              Effect: Allow
+              Action:
+                - "sms-voice:SendTextMessage"
+              Resource:
+                - !Ref OriginationIdentityArn
+                - !Sub "arn:${AWS::Partition}:sms-voice:${AWS::Region}:${AWS::AccountId}:configuration-set/*"
+        - DynamoDBReadPolicy:
+            TableName: !Ref SMSTemplatesTable
+      Events:
+        SMSRule:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref MessagesEventBus
+            Pattern:
+              detail:
+                MessageConfiguration:
+                  SMSMessage:
+                    MessageType:
+                      - exists: true
+
+  ##########################################################################
+  #   Log Groups - created explicitly so retention is bounded              #
+  #   (Lambda's implicit log groups never expire)                          #
+  ##########################################################################
+  EmailLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-EmailProcessor"
+      RetentionInDays: !Ref LogRetentionInDays
+
+  SMSLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-SMSProcessor"
+      RetentionInDays: !Ref LogRetentionInDays
+
+##########################################################################
+#   Outputs                                                              #
+##########################################################################
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway endpoint URL. Requires SigV4-signed requests (AuthorizationType: AWS_IAM)."
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod/"
+
+  EmailLambdaFunctionArn:
+    Description: "Email Lambda Function ARN"
+    Value: !GetAtt EmailLambdaFunction.Arn
+
+  SMSLambdaFunctionArn:
+    Description: "SMS Lambda Function ARN"
+    Value: !GetAtt SMSLambdaFunction.Arn
+
+  SMSTemplatesTableName:
+    Description: "DynamoDB table name for SMS templates"
+    Value: !Ref SMSTemplatesTable
+
+  EventBusName:
+    Description: "EventBridge custom bus name"
+    Value: !Ref MessagesEventBus
